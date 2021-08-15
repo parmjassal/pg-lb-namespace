@@ -1,5 +1,5 @@
 From 10bcbcd31bca5f8114542a7e1de571649c50d065 Mon Sep 17 00:00:00 2001
-From: "parmpree.singh" <parmpreet.singh@nutanix.com>
+From: "parmjassal" <parmjassalxxx@xxx.com>
 Date: Sun, 15 Aug 2021 19:49:13 +0530
 Subject: [PATCH] Adding support to add multiple disk under single Namespace.
  The idea behind using multiple disk is to loadbalance the relations across
