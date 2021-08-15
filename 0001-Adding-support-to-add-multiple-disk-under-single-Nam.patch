@@ -1,0 +1,666 @@
+From 10bcbcd31bca5f8114542a7e1de571649c50d065 Mon Sep 17 00:00:00 2001
+From: "parmpree.singh" <parmpreet.singh@nutanix.com>
+Date: Sun, 15 Aug 2021 19:49:13 +0530
+Subject: [PATCH] Adding support to add multiple disk under single Namespace.
+ The idea behind using multiple disk is to loadbalance the relations across
+ multiple physical disk for the db.
+
+1. Added lb_dirs configuration in postgres config
+   example:- lb_dirs=<dir1>,<dir2>,
+   Caution: It needs to end with ','.
+2. Added new 'lb_global' tablespace as part of bootstrap which can be
+   used to create db or table with this namespace.
+3. Use LB_DIRS env to set lb_dirs as part of initdb command.
+
+Note:-
+Not to changes the 'lb_dirs' once set or initialised, as we are using
+modular operation for load balancing across the drives mentioned in
+lb_dirs.
+---
+ src/backend/commands/tablespace.c             | 134 ++++++++++--------
+ src/backend/postmaster/postmaster.c           |   5 +
+ src/backend/utils/init/globals.c              |   4 +
+ src/backend/utils/init/miscinit.c             |  40 ++++++
+ src/backend/utils/misc/guc.c                  |  23 ++-
+ src/backend/utils/misc/postgresql.conf.sample |   3 +
+ src/bin/initdb/initdb.c                       |  44 +++++-
+ src/common/relpath.c                          |  52 +++++--
+ src/include/common/relpath.h                  |   9 ++
+ src/include/miscadmin.h                       |   2 +
+ 10 files changed, 245 insertions(+), 71 deletions(-)
+
+diff --git a/src/backend/commands/tablespace.c b/src/backend/commands/tablespace.c
+index 051478057f..25a92a0d49 100644
+--- a/src/backend/commands/tablespace.c
++++ b/src/backend/commands/tablespace.c
+@@ -69,6 +69,7 @@
+ #include "commands/seclabel.h"
+ #include "commands/tablecmds.h"
+ #include "commands/tablespace.h"
++#include "common/relpath.h"
+ #include "common/file_perm.h"
+ #include "miscadmin.h"
+ #include "postmaster/bgwriter.h"
+@@ -88,46 +89,15 @@
+ char	   *default_tablespace = NULL;
+ char	   *temp_tablespaces = NULL;
+ 
+-
+ static void create_tablespace_directories(const char *location,
+ 										  const Oid tablespaceoid);
+ static bool destroy_tablespace_directories(Oid tablespaceoid, bool redo);
+ 
+ 
+-/*
+- * Each database using a table space is isolated into its own name space
+- * by a subdirectory named for the database OID.  On first creation of an
+- * object in the tablespace, create the subdirectory.  If the subdirectory
+- * already exists, fall through quietly.
+- *
+- * isRedo indicates that we are creating an object during WAL replay.
+- * In this case we will cope with the possibility of the tablespace
+- * directory not being there either --- this could happen if we are
+- * replaying an operation on a table in a subsequently-dropped tablespace.
+- * We handle this by making a directory in the place where the tablespace
+- * symlink would normally be.  This isn't an exact replay of course, but
+- * it's the best we can do given the available information.
+- *
+- * If tablespaces are not supported, we still need it in case we have to
+- * re-create a database subdirectory (of $PGDATA/base) during WAL replay.
+- */
+-void
+-TablespaceCreateDbspace(Oid spcNode, Oid dbNode, bool isRedo)
++static void
++create_directory(const char *dir, bool isRedo)
+ {
+ 	struct stat st;
+-	char	   *dir;
+-
+-	/*
+-	 * The global tablespace doesn't have per-database subdirectories, so
+-	 * nothing to do for it.
+-	 */
+-	if (spcNode == GLOBALTABLESPACE_OID)
+-		return;
+-
+-	Assert(OidIsValid(spcNode));
+-	Assert(OidIsValid(dbNode));
+-
+-	dir = GetDatabasePath(dbNode, spcNode);
+ 
+ 	if (stat(dir, &st) < 0)
+ 	{
+@@ -157,10 +127,10 @@ TablespaceCreateDbspace(Oid spcNode, Oid dbNode, bool isRedo)
+ 
+ 					/* Failure other than not exists or not in WAL replay? */
+ 					if (errno != ENOENT || !isRedo)
+-						ereport(ERROR,
+-								(errcode_for_file_access(),
+-								 errmsg("could not create directory \"%s\": %m",
+-										dir)));
++						ereport(
++								ERROR,
++								(errcode_for_file_access(), errmsg(
++																   "could not create directory \"%s\": %m", dir)));
+ 
+ 					/*
+ 					 * Parent directories are missing during WAL replay, so
+@@ -174,10 +144,10 @@ TablespaceCreateDbspace(Oid spcNode, Oid dbNode, bool isRedo)
+ 					get_parent_directory(parentdir);
+ 					/* Can't create parent and it doesn't already exist? */
+ 					if (MakePGDirectory(parentdir) < 0 && errno != EEXIST)
+-						ereport(ERROR,
+-								(errcode_for_file_access(),
+-								 errmsg("could not create directory \"%s\": %m",
+-										parentdir)));
++						ereport(
++								ERROR,
++								(errcode_for_file_access(), errmsg(
++																   "could not create directory \"%s\": %m", parentdir)));
+ 					pfree(parentdir);
+ 
+ 					/* create one parent up if not exist */
+@@ -185,18 +155,18 @@ TablespaceCreateDbspace(Oid spcNode, Oid dbNode, bool isRedo)
+ 					get_parent_directory(parentdir);
+ 					/* Can't create parent and it doesn't already exist? */
+ 					if (MakePGDirectory(parentdir) < 0 && errno != EEXIST)
+-						ereport(ERROR,
+-								(errcode_for_file_access(),
+-								 errmsg("could not create directory \"%s\": %m",
+-										parentdir)));
++						ereport(
++								ERROR,
++								(errcode_for_file_access(), errmsg(
++																   "could not create directory \"%s\": %m", parentdir)));
+ 					pfree(parentdir);
+ 
+ 					/* Create database directory */
+ 					if (MakePGDirectory(dir) < 0)
+-						ereport(ERROR,
+-								(errcode_for_file_access(),
+-								 errmsg("could not create directory \"%s\": %m",
+-										dir)));
++						ereport(
++								ERROR,
++								(errcode_for_file_access(), errmsg(
++																   "could not create directory \"%s\": %m", dir)));
+ 				}
+ 			}
+ 
+@@ -204,22 +174,72 @@ TablespaceCreateDbspace(Oid spcNode, Oid dbNode, bool isRedo)
+ 		}
+ 		else
+ 		{
+-			ereport(ERROR,
+-					(errcode_for_file_access(),
+-					 errmsg("could not stat directory \"%s\": %m", dir)));
++			ereport(
++					ERROR,
++					(errcode_for_file_access(), errmsg(
++													   "could not stat directory \"%s\": %m", dir)));
+ 		}
+ 	}
+ 	else
+ 	{
+ 		/* Is it not a directory? */
+ 		if (!S_ISDIR(st.st_mode))
+-			ereport(ERROR,
+-					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+-					 errmsg("\"%s\" exists but is not a directory",
+-							dir)));
++			ereport(
++					ERROR,
++					(errcode(ERRCODE_WRONG_OBJECT_TYPE), errmsg("\"%s\" exists but is not a directory", dir)));
+ 	}
++}
++
++/*
++ * Each database using a table space is isolated into its own name space
++ * by a subdirectory named for the database OID.  On first creation of an
++ * object in the tablespace, create the subdirectory.  If the subdirectory
++ * already exists, fall through quietly.
++ *
++ * isRedo indicates that we are creating an object during WAL replay.
++ * In this case we will cope with the possibility of the tablespace
++ * directory not being there either --- this could happen if we are
++ * replaying an operation on a table in a subsequently-dropped tablespace.
++ * We handle this by making a directory in the place where the tablespace
++ * symlink would normally be.  This isn't an exact replay of course, but
++ * it's the best we can do given the available information.
++ *
++ * If tablespaces are not supported, we still need it in case we have to
++ * re-create a database subdirectory (of $PGDATA/base) during WAL replay.
++ */
++void
++TablespaceCreateDbspace(Oid spcNode, Oid dbNode, bool isRedo)
++{
++	struct stat st;
++	char	   *dir;
++
++	/* GetPathSize(); */
++
++	/*
++	 * The global tablespace doesn't have per-database subdirectories, so
++	 * nothing to do for it.
++	 */
++	if (spcNode == GLOBALTABLESPACE_OID)
++		return;
+ 
+-	pfree(dir);
++	Assert(OidIsValid(spcNode));
++	Assert(OidIsValid(dbNode));
++
++	if (spcNode == LBTABLESPACE_OID)
++	{
++		for (int i = 0; i < LBDataDirCount; i++)
++		{
++			dir = psprintf("%s/%u", LBPath[i], dbNode);
++			create_directory(dir, isRedo);
++			pfree(dir);
++		}
++	}
++	else
++	{
++		dir = GetDatabasePath(dbNode, spcNode);
++		create_directory(dir, isRedo);
++		pfree(dir);
++	}
+ }
+ 
+ /*
+diff --git a/src/backend/postmaster/postmaster.c b/src/backend/postmaster/postmaster.c
+index b4d475bb0b..7936d7c754 100644
+--- a/src/backend/postmaster/postmaster.c
++++ b/src/backend/postmaster/postmaster.c
+@@ -478,6 +478,7 @@ typedef struct
+ 	Port		port;
+ 	InheritableSocket portsocket;
+ 	char		DataDir[MAXPGPATH];
++	char		LbDir[MAXPGPATH];
+ 	pgsocket	ListenSocket[MAXLISTEN];
+ 	int32		MyCancelKey;
+ 	int			MyPMChildSlot;
+@@ -6171,6 +6172,7 @@ save_backend_variables(BackendParameters *param, Port *port,
+ 		return false;
+ 
+ 	strlcpy(param->DataDir, DataDir, MAXPGPATH);
++	strlcpy(param->LbDir, LBDataDir, MAXPGPATH);
+ 
+ 	memcpy(&param->ListenSocket, &ListenSocket, sizeof(ListenSocket));
+ 
+@@ -6403,10 +6405,13 @@ read_backend_variables(char *id, Port *port)
+ static void
+ restore_backend_variables(BackendParameters *param, Port *port)
+ {
++
+ 	memcpy(port, &param->port, sizeof(Port));
+ 	read_inheritable_socket(&port->sock, &param->portsocket);
+ 
+ 	SetDataDir(param->DataDir);
++	SetLbDir(param->LbDir);
++
+ 
+ 	memcpy(&ListenSocket, &param->ListenSocket, sizeof(ListenSocket));
+ 
+diff --git a/src/backend/utils/init/globals.c b/src/backend/utils/init/globals.c
+index eb19644419..bb270be3ce 100644
+--- a/src/backend/utils/init/globals.c
++++ b/src/backend/utils/init/globals.c
+@@ -61,6 +61,8 @@ struct Latch *MyLatch;
+  */
+ char	   *DataDir = NULL;
+ 
++char	   *LBDataDir = NULL;
++
+ /*
+  * Mode of the data directory.  The default is 0700 but it may be changed in
+  * checkDataDir() to 0750 if the data directory actually has that mode.
+@@ -92,6 +94,8 @@ Oid			MyDatabaseTableSpace = InvalidOid;
+  */
+ char	   *DatabasePath = NULL;
+ 
++
++
+ pid_t		PostmasterPid = 0;
+ 
+ /*
+diff --git a/src/backend/utils/init/miscinit.c b/src/backend/utils/init/miscinit.c
+index cca9704d2d..dcae9f2209 100644
+--- a/src/backend/utils/init/miscinit.c
++++ b/src/backend/utils/init/miscinit.c
+@@ -31,6 +31,7 @@
+ #include "access/htup_details.h"
+ #include "catalog/pg_authid.h"
+ #include "common/file_perm.h"
++#include "common/relpath.h"
+ #include "libpq/libpq.h"
+ #include "mb/pg_wchar.h"
+ #include "miscadmin.h"
+@@ -378,6 +379,45 @@ SetDataDir(const char *dir)
+ 	DataDir = new;
+ }
+ 
++void
++SetLbDir(const char *dir)
++{
++	if (dir == NULL)
++		return;
++	if (LBDataDir)
++		free(LBDataDir);
++	LBDataDir = dir;
++	/* find the number of directories; */
++	LBDataDirCount = 0;
++	char	   *index = LBDataDir;
++
++	index = strchr(index, ',');
++	while (index != NULL)
++	{
++		LBDataDirCount++;
++		index++;
++		index = strchr(index, ',');
++	}
++	LBPath = malloc(sizeof(char *) * LBDataDirCount);
++	/* find the directory path; */
++	char	   *pre_index = LBDataDir;
++
++	index = strchr(pre_index, ',');
++	int			i = 0;
++
++	while (index != NULL)
++	{
++		int			length = (index - pre_index);
++
++		LBPath[i] = malloc(length + 1);
++		memcpy(LBPath[i], pre_index, length);
++		LBPath[i][length] = '\0';
++		pre_index = index + 1;
++		index = strchr(pre_index, ',');
++		i++;
++	}
++}
++
+ /*
+  * Change working directory to DataDir.  Most of the postmaster and backend
+  * code assumes that we are in DataDir so it can use relative paths to access
+diff --git a/src/backend/utils/misc/guc.c b/src/backend/utils/misc/guc.c
+index 75fc6f11d6..a0264144ca 100644
+--- a/src/backend/utils/misc/guc.c
++++ b/src/backend/utils/misc/guc.c
+@@ -44,6 +44,7 @@
+ #include "commands/vacuum.h"
+ #include "commands/variable.h"
+ #include "common/string.h"
++#include "common/relpath.h"
+ #include "funcapi.h"
+ #include "jit/jit.h"
+ #include "libpq/auth.h"
+@@ -595,6 +596,7 @@ static char *timezone_string;
+ static char *log_timezone_string;
+ static char *timezone_abbreviations_string;
+ static char *data_directory;
++static char *lb_directory;
+ static char *session_authorization_string;
+ static int	max_function_args;
+ static int	max_index_keys;
+@@ -3659,6 +3661,21 @@ static struct config_real ConfigureNamesReal[] =
+ 
+ static struct config_string ConfigureNamesString[] =
+ {
++	{
++		/*
++		 * Can't be set by ALTER SYSTEM as it can lead to recursive definition
++		 * of data_directory.
++		 */
++		{"lb_dirs", PGC_POSTMASTER, FILE_LOCATIONS,
++			gettext_noop("Sets the directories to be used for load balancing."),
++			NULL,
++			GUC_SUPERUSER_ONLY | GUC_DISALLOW_IN_AUTO_FILE
++		},
++		&lb_directory,
++		NULL,
++		NULL, NULL, NULL
++	},
++
+ 	{
+ 		{"archive_command", PGC_SIGHUP, WAL_ARCHIVING,
+ 			gettext_noop("Sets the shell command that will be called to archive a WAL file."),
+@@ -4788,7 +4805,6 @@ static int	num_guc_variables;
+ /* Vector capacity */
+ static int	size_guc_variables;
+ 
+-
+ static bool guc_dirty;			/* true if need to do commit/abort work */
+ 
+ static bool reporting_enabled;	/* true to enable GUC_REPORT */
+@@ -5653,6 +5669,11 @@ SelectConfigFiles(const char *userDoption, const char *progname)
+ 	 */
+ 	pg_timezone_abbrev_initialize();
+ 
++	if (lb_directory != NULL && strlen(lb_directory) > 0)
++	{
++		SetLbDir(lb_directory);
++	}
++
+ 	/*
+ 	 * Figure out where pg_hba.conf is, and make sure the path is absolute.
+ 	 */
+diff --git a/src/backend/utils/misc/postgresql.conf.sample b/src/backend/utils/misc/postgresql.conf.sample
+index 3a25287a39..7dc101d9c3 100644
+--- a/src/backend/utils/misc/postgresql.conf.sample
++++ b/src/backend/utils/misc/postgresql.conf.sample
+@@ -776,3 +776,6 @@
+ #------------------------------------------------------------------------------
+ 
+ # Add settings for extensions here
++
++#lb_dirs =
++
+diff --git a/src/bin/initdb/initdb.c b/src/bin/initdb/initdb.c
+index 786672b1b6..fe8fb9f8dd 100644
+--- a/src/bin/initdb/initdb.c
++++ b/src/bin/initdb/initdb.c
+@@ -223,7 +223,6 @@ static const char *const subdirs[] = {
+ 	"pg_logical/mappings"
+ };
+ 
+-
+ /* path to 'initdb' binary directory */
+ static char bin_path[MAXPGPATH];
+ static char backend_exec[MAXPGPATH];
+@@ -242,6 +241,7 @@ static int	get_encoding_id(const char *encoding_name);
+ static void set_input(char **dest, const char *filename);
+ static void check_input(char *path);
+ static void write_version_file(const char *extrapath);
++static void write_version_file_full(const char *extrapath);
+ static void set_null_conf(void);
+ static void test_config_settings(void);
+ static void setup_config(void);
+@@ -861,6 +861,32 @@ write_version_file(const char *extrapath)
+ 	free(path);
+ }
+ 
++
++/*
++ * write out the PG_VERSION file in the data dir, or its subdirectory
++ * if extrapath is not NULL
++ */
++static void
++write_version_file_full(const char *extrapath)
++{
++	FILE	   *version_file;
++	char	   *path = psprintf("%s/PG_VERSION", extrapath);;
++
++	if ((version_file = fopen(path, PG_BINARY_W)) == NULL)
++	{
++		pg_log_error("could not open file \"%s\" for writing: %m", path);
++		exit(1);
++	}
++	if (fprintf(version_file, "%s\n", PG_MAJORVERSION) < 0 ||
++		fclose(version_file))
++	{
++		pg_log_error("could not write file \"%s\": %m", path);
++		exit(1);
++	}
++	free(path);
++}
++
++
+ /*
+  * set up an empty config file so we can check config settings by launching
+  * a test backend
+@@ -987,7 +1013,7 @@ test_config_settings(void)
+ 		test_buffs = MIN_BUFS_FOR_CONNS(test_conns);
+ 
+ 		snprintf(cmd, sizeof(cmd),
+-				 "\"%s\" --boot -x0 %s "
++				 " \"%s\" --boot -x0 %s "
+ 				 "-c max_connections=%d "
+ 				 "-c shared_buffers=%d "
+ 				 "-c dynamic_shared_memory_type=%s "
+@@ -1023,7 +1049,7 @@ test_config_settings(void)
+ 		}
+ 
+ 		snprintf(cmd, sizeof(cmd),
+-				 "\"%s\" --boot -x0 %s "
++				 " \"%s\" --boot -x0 %s "
+ 				 "-c max_connections=%d "
+ 				 "-c shared_buffers=%d "
+ 				 "-c dynamic_shared_memory_type=%s "
+@@ -1084,6 +1110,13 @@ setup_config(void)
+ 
+ 	conflines = readfile(conf_file);
+ 
++
++	if (getenv("LB_DIRS") != NULL)
++	{
++		snprintf(repltok, sizeof(repltok), "lb_dirs = '%s'", getenv("LB_DIRS"));
++		conflines = replace_token(conflines, "#lb_dirs =", repltok);
++	}
++
+ 	snprintf(repltok, sizeof(repltok), "max_connections = %d", n_connections);
+ 	conflines = replace_token(conflines, "#max_connections = 100", repltok);
+ 
+@@ -1428,7 +1461,7 @@ bootstrap_template1(void)
+ 	unsetenv("PGCLIENTENCODING");
+ 
+ 	snprintf(cmd, sizeof(cmd),
+-			 "\"%s\" --boot -x1 -X %u %s %s %s",
++			 " \"%s\" --boot -x1 -X %u %s %s %s",
+ 			 backend_exec,
+ 			 wal_segment_size_mb * (1024 * 1024),
+ 			 data_checksums ? "-k" : "",
+@@ -2916,10 +2949,11 @@ initialize_data_directory(void)
+ 	fflush(stdout);
+ 
+ 	snprintf(cmd, sizeof(cmd),
+-			 "\"%s\" %s template1 >%s",
++			 " \"%s\" %s template1 >%s",
+ 			 backend_exec, backend_options,
+ 			 DEVNULL);
+ 
++
+ 	PG_CMD_OPEN;
+ 
+ 	setup_auth(cmdfd);
+diff --git a/src/common/relpath.c b/src/common/relpath.c
+index ad733d1363..eb803699c6 100644
+--- a/src/common/relpath.c
++++ b/src/common/relpath.c
+@@ -22,6 +22,7 @@
+ #include "common/relpath.h"
+ #include "storage/backendid.h"
+ 
++#include <unistd.h>
+ 
+ /*
+  * Lookup table of fork name by fork number.
+@@ -40,6 +41,11 @@ const char *const forkNames[] = {
+ StaticAssertDecl(lengthof(forkNames) == (MAX_FORKNUM + 1),
+ 				 "array length mismatch");
+ 
++
++int			LBDataDirCount;
++
++char	  **LBPath;
++
+ /*
+  * forkname_to_number - look up fork number by name
+  *
+@@ -120,6 +126,14 @@ GetDatabasePath(Oid dbNode, Oid spcNode)
+ 		/* The default tablespace is {datadir}/base */
+ 		return psprintf("base/%u", dbNode);
+ 	}
++	else if (spcNode == LBTABLESPACE_OID)
++	{
++        if( LBDataDirCount == 0 ) {
++            fprintf(stderr," lb_dirs is not set to lb_global namespace");
++            return NULL;
++        }
++		return psprintf("%s/%u", LBPath[0], dbNode);
++	}
+ 	else
+ 	{
+ 		/* All other tablespaces are accessed via symlinks */
+@@ -160,22 +174,44 @@ GetRelationPath(Oid dbNode, Oid spcNode, Oid relNode,
+ 		if (backendId == InvalidBackendId)
+ 		{
+ 			if (forkNumber != MAIN_FORKNUM)
+-				path = psprintf("base/%u/%u_%s",
+-								dbNode, relNode,
++				path = psprintf("base/%u/%u_%s", dbNode, relNode,
+ 								forkNames[forkNumber]);
+ 			else
+-				path = psprintf("base/%u/%u",
+-								dbNode, relNode);
++				path = psprintf("base/%u/%u", dbNode, relNode);
+ 		}
+ 		else
+ 		{
+ 			if (forkNumber != MAIN_FORKNUM)
+-				path = psprintf("base/%u/t%d_%u_%s",
+-								dbNode, backendId, relNode,
++				path = psprintf("base/%u/t%d_%u_%s", dbNode, backendId, relNode,
+ 								forkNames[forkNumber]);
+ 			else
+-				path = psprintf("base/%u/t%d_%u",
+-								dbNode, backendId, relNode);
++				path = psprintf("base/%u/t%d_%u", dbNode, backendId, relNode);
++		}
++	}
++	else if (spcNode == LBTABLESPACE_OID)
++	{
++	    if( LBDataDirCount == 0 ) {
++	        fprintf(stderr," lb_dirs is not set to lb_global namespace");
++	        return NULL;
++	    }
++		int			index = relNode < 10000 ? 0 : relNode % LBDataDirCount;
++
++		if (backendId == InvalidBackendId)
++		{
++			if (forkNumber != MAIN_FORKNUM)
++				path = psprintf("%s/%u/%u_%s", LBPath[index], dbNode, relNode,
++								forkNames[forkNumber]);
++			else
++				path = psprintf("%s/%u/%u", LBPath[index], dbNode, relNode);
++		}
++		else
++		{
++			if (forkNumber != MAIN_FORKNUM)
++				path = psprintf("%s/%u/t%d_%u_%s", LBPath[index], dbNode, backendId,
++								relNode, forkNames[forkNumber]);
++			else
++				path = psprintf("%s/%u/t%d_%u", LBPath[index], dbNode, backendId,
++								relNode);
+ 		}
+ 	}
+ 	else
+diff --git a/src/include/common/relpath.h b/src/include/common/relpath.h
+index 869cabcc0d..4edf77970d 100644
+--- a/src/include/common/relpath.h
++++ b/src/include/common/relpath.h
+@@ -29,6 +29,10 @@
+ /* Characters to allow for an OID in a relation path */
+ #define OIDCHARS		10		/* max chars printed by %u */
+ 
++extern int	LBDataDirCount;
++
++extern char **LBPath;
++
+ /*
+  * Stuff for fork names.
+  *
+@@ -52,6 +56,11 @@ typedef enum ForkNumber
+ 	 */
+ } ForkNumber;
+ 
++extern int	LBDataDirCount;
++
++extern char **LBPath;
++
++
+ #define MAX_FORKNUM		INIT_FORKNUM
+ 
+ #define FORKNAMECHARS	4		/* max chars for a fork name */
+diff --git a/src/include/miscadmin.h b/src/include/miscadmin.h
+index 18bc8a7b90..8a13e0e087 100644
+--- a/src/include/miscadmin.h
++++ b/src/include/miscadmin.h
+@@ -154,6 +154,7 @@ extern PGDLLIMPORT bool IsBinaryUpgrade;
+ extern PGDLLIMPORT bool ExitOnAnyError;
+ 
+ extern PGDLLIMPORT char *DataDir;
++extern PGDLLIMPORT char *LBDataDir;
+ extern PGDLLIMPORT int data_directory_mode;
+ 
+ extern PGDLLIMPORT int NBuffers;
+@@ -331,6 +332,7 @@ extern const char *GetBackendTypeDesc(BackendType backendType);
+ extern void SetDatabasePath(const char *path);
+ extern void checkDataDir(void);
+ extern void SetDataDir(const char *dir);
++extern void SetLbDir(const char *dir);
+ extern void ChangeToDataDir(void);
+ 
+ extern char *GetUserNameFromId(Oid roleid, bool noerr);
+-- 
+2.24.3 (Apple Git-128)
+
