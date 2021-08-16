@@ -1,6 +1,6 @@
-From 10bcbcd31bca5f8114542a7e1de571649c50d065 Mon Sep 17 00:00:00 2001
-From: "parmjassal" <parmjassalxxx@xxx.com>
-Date: Sun, 15 Aug 2021 19:49:13 +0530
+From f432e195d77ddd29df21484aa1383860b9b2876e Mon Sep 17 00:00:00 2001
+From: parmjassal <parmjassalxxxx@gmail.com>
+Date: Mon, 16 Aug 2021 14:58:17 +0530
 Subject: [PATCH] Adding support to add multiple disk under single Namespace.
  The idea behind using multiple disk is to loadbalance the relations across
  multiple physical disk for the db.
@@ -23,14 +23,14 @@ lb_dirs.
  src/backend/utils/init/miscinit.c             |  40 ++++++
  src/backend/utils/misc/guc.c                  |  23 ++-
  src/backend/utils/misc/postgresql.conf.sample |   3 +
- src/bin/initdb/initdb.c                       |  44 +++++-
+ src/bin/initdb/initdb.c                       |  35 ++++-
  src/common/relpath.c                          |  52 +++++--
  src/include/common/relpath.h                  |   9 ++
  src/include/miscadmin.h                       |   2 +
- 10 files changed, 245 insertions(+), 71 deletions(-)
+ 10 files changed, 240 insertions(+), 67 deletions(-)
 
 diff --git a/src/backend/commands/tablespace.c b/src/backend/commands/tablespace.c
-index 051478057f..25a92a0d49 100644
+index a54239a8b3..d22a43292c 100644
 --- a/src/backend/commands/tablespace.c
 +++ b/src/backend/commands/tablespace.c
 @@ -69,6 +69,7 @@
@@ -229,10 +229,10 @@ index 051478057f..25a92a0d49 100644
  
  /*
 diff --git a/src/backend/postmaster/postmaster.c b/src/backend/postmaster/postmaster.c
-index b4d475bb0b..7936d7c754 100644
+index 9c2c98614a..a3b4ec2615 100644
 --- a/src/backend/postmaster/postmaster.c
 +++ b/src/backend/postmaster/postmaster.c
-@@ -478,6 +478,7 @@ typedef struct
+@@ -491,6 +491,7 @@ typedef struct
  	Port		port;
  	InheritableSocket portsocket;
  	char		DataDir[MAXPGPATH];
@@ -240,7 +240,7 @@ index b4d475bb0b..7936d7c754 100644
  	pgsocket	ListenSocket[MAXLISTEN];
  	int32		MyCancelKey;
  	int			MyPMChildSlot;
-@@ -6171,6 +6172,7 @@ save_backend_variables(BackendParameters *param, Port *port,
+@@ -6142,6 +6143,7 @@ save_backend_variables(BackendParameters *param, Port *port,
  		return false;
  
  	strlcpy(param->DataDir, DataDir, MAXPGPATH);
@@ -248,7 +248,7 @@ index b4d475bb0b..7936d7c754 100644
  
  	memcpy(&param->ListenSocket, &ListenSocket, sizeof(ListenSocket));
  
-@@ -6403,10 +6405,13 @@ read_backend_variables(char *id, Port *port)
+@@ -6373,10 +6375,13 @@ read_backend_variables(char *id, Port *port)
  static void
  restore_backend_variables(BackendParameters *param, Port *port)
  {
@@ -263,10 +263,10 @@ index b4d475bb0b..7936d7c754 100644
  	memcpy(&ListenSocket, &param->ListenSocket, sizeof(ListenSocket));
  
 diff --git a/src/backend/utils/init/globals.c b/src/backend/utils/init/globals.c
-index eb19644419..bb270be3ce 100644
+index 381d9e548d..0a1ce24634 100644
 --- a/src/backend/utils/init/globals.c
 +++ b/src/backend/utils/init/globals.c
-@@ -61,6 +61,8 @@ struct Latch *MyLatch;
+@@ -64,6 +64,8 @@ struct Latch *MyLatch;
   */
  char	   *DataDir = NULL;
  
@@ -275,7 +275,7 @@ index eb19644419..bb270be3ce 100644
  /*
   * Mode of the data directory.  The default is 0700 but it may be changed in
   * checkDataDir() to 0750 if the data directory actually has that mode.
-@@ -92,6 +94,8 @@ Oid			MyDatabaseTableSpace = InvalidOid;
+@@ -95,6 +97,8 @@ Oid			MyDatabaseTableSpace = InvalidOid;
   */
  char	   *DatabasePath = NULL;
  
@@ -285,7 +285,7 @@ index eb19644419..bb270be3ce 100644
  
  /*
 diff --git a/src/backend/utils/init/miscinit.c b/src/backend/utils/init/miscinit.c
-index cca9704d2d..dcae9f2209 100644
+index 88801374b5..a20fc96b2b 100644
 --- a/src/backend/utils/init/miscinit.c
 +++ b/src/backend/utils/init/miscinit.c
 @@ -31,6 +31,7 @@
@@ -294,9 +294,9 @@ index cca9704d2d..dcae9f2209 100644
  #include "common/file_perm.h"
 +#include "common/relpath.h"
  #include "libpq/libpq.h"
+ #include "libpq/pqsignal.h"
  #include "mb/pg_wchar.h"
- #include "miscadmin.h"
-@@ -378,6 +379,45 @@ SetDataDir(const char *dir)
+@@ -425,6 +426,45 @@ SetDataDir(const char *dir)
  	DataDir = new;
  }
  
@@ -343,10 +343,10 @@ index cca9704d2d..dcae9f2209 100644
   * Change working directory to DataDir.  Most of the postmaster and backend
   * code assumes that we are in DataDir so it can use relative paths to access
 diff --git a/src/backend/utils/misc/guc.c b/src/backend/utils/misc/guc.c
-index 75fc6f11d6..a0264144ca 100644
+index a2e0f8de7e..2605f3469a 100644
 --- a/src/backend/utils/misc/guc.c
 +++ b/src/backend/utils/misc/guc.c
-@@ -44,6 +44,7 @@
+@@ -51,6 +51,7 @@
  #include "commands/vacuum.h"
  #include "commands/variable.h"
  #include "common/string.h"
@@ -354,7 +354,7 @@ index 75fc6f11d6..a0264144ca 100644
  #include "funcapi.h"
  #include "jit/jit.h"
  #include "libpq/auth.h"
-@@ -595,6 +596,7 @@ static char *timezone_string;
+@@ -658,6 +659,7 @@ static char *timezone_string;
  static char *log_timezone_string;
  static char *timezone_abbreviations_string;
  static char *data_directory;
@@ -362,7 +362,7 @@ index 75fc6f11d6..a0264144ca 100644
  static char *session_authorization_string;
  static int	max_function_args;
  static int	max_index_keys;
-@@ -3659,6 +3661,21 @@ static struct config_real ConfigureNamesReal[] =
+@@ -3824,6 +3826,21 @@ static struct config_real ConfigureNamesReal[] =
  
  static struct config_string ConfigureNamesString[] =
  {
@@ -384,7 +384,7 @@ index 75fc6f11d6..a0264144ca 100644
  	{
  		{"archive_command", PGC_SIGHUP, WAL_ARCHIVING,
  			gettext_noop("Sets the shell command that will be called to archive a WAL file."),
-@@ -4788,7 +4805,6 @@ static int	num_guc_variables;
+@@ -5003,7 +5020,6 @@ static int	num_guc_variables;
  /* Vector capacity */
  static int	size_guc_variables;
  
@@ -392,7 +392,7 @@ index 75fc6f11d6..a0264144ca 100644
  static bool guc_dirty;			/* true if need to do commit/abort work */
  
  static bool reporting_enabled;	/* true to enable GUC_REPORT */
-@@ -5653,6 +5669,11 @@ SelectConfigFiles(const char *userDoption, const char *progname)
+@@ -5941,6 +5957,11 @@ SelectConfigFiles(const char *userDoption, const char *progname)
  	 */
  	pg_timezone_abbrev_initialize();
  
@@ -405,10 +405,10 @@ index 75fc6f11d6..a0264144ca 100644
  	 * Figure out where pg_hba.conf is, and make sure the path is absolute.
  	 */
 diff --git a/src/backend/utils/misc/postgresql.conf.sample b/src/backend/utils/misc/postgresql.conf.sample
-index 3a25287a39..7dc101d9c3 100644
+index b242a7fc8b..c7b08f94ba 100644
 --- a/src/backend/utils/misc/postgresql.conf.sample
 +++ b/src/backend/utils/misc/postgresql.conf.sample
-@@ -776,3 +776,6 @@
+@@ -795,3 +795,6 @@
  #------------------------------------------------------------------------------
  
  # Add settings for extensions here
@@ -416,10 +416,10 @@ index 3a25287a39..7dc101d9c3 100644
 +#lb_dirs =
 +
 diff --git a/src/bin/initdb/initdb.c b/src/bin/initdb/initdb.c
-index 786672b1b6..fe8fb9f8dd 100644
+index 5e84c7bb20..6ca714f9b0 100644
 --- a/src/bin/initdb/initdb.c
 +++ b/src/bin/initdb/initdb.c
-@@ -223,7 +223,6 @@ static const char *const subdirs[] = {
+@@ -230,7 +230,6 @@ static const char *const subdirs[] = {
  	"pg_logical/mappings"
  };
  
@@ -427,7 +427,7 @@ index 786672b1b6..fe8fb9f8dd 100644
  /* path to 'initdb' binary directory */
  static char bin_path[MAXPGPATH];
  static char backend_exec[MAXPGPATH];
-@@ -242,6 +241,7 @@ static int	get_encoding_id(const char *encoding_name);
+@@ -249,6 +248,7 @@ static int	get_encoding_id(const char *encoding_name);
  static void set_input(char **dest, const char *filename);
  static void check_input(char *path);
  static void write_version_file(const char *extrapath);
@@ -435,7 +435,7 @@ index 786672b1b6..fe8fb9f8dd 100644
  static void set_null_conf(void);
  static void test_config_settings(void);
  static void setup_config(void);
-@@ -861,6 +861,32 @@ write_version_file(const char *extrapath)
+@@ -839,6 +839,32 @@ write_version_file(const char *extrapath)
  	free(path);
  }
  
@@ -468,25 +468,7 @@ index 786672b1b6..fe8fb9f8dd 100644
  /*
   * set up an empty config file so we can check config settings by launching
   * a test backend
-@@ -987,7 +1013,7 @@ test_config_settings(void)
- 		test_buffs = MIN_BUFS_FOR_CONNS(test_conns);
- 
- 		snprintf(cmd, sizeof(cmd),
--				 "\"%s\" --boot -x0 %s "
-+				 " \"%s\" --boot -x0 %s "
- 				 "-c max_connections=%d "
- 				 "-c shared_buffers=%d "
- 				 "-c dynamic_shared_memory_type=%s "
-@@ -1023,7 +1049,7 @@ test_config_settings(void)
- 		}
- 
- 		snprintf(cmd, sizeof(cmd),
--				 "\"%s\" --boot -x0 %s "
-+				 " \"%s\" --boot -x0 %s "
- 				 "-c max_connections=%d "
- 				 "-c shared_buffers=%d "
- 				 "-c dynamic_shared_memory_type=%s "
-@@ -1084,6 +1110,13 @@ setup_config(void)
+@@ -1062,6 +1088,13 @@ setup_config(void)
  
  	conflines = readfile(conf_file);
  
@@ -500,30 +482,8 @@ index 786672b1b6..fe8fb9f8dd 100644
  	snprintf(repltok, sizeof(repltok), "max_connections = %d", n_connections);
  	conflines = replace_token(conflines, "#max_connections = 100", repltok);
  
-@@ -1428,7 +1461,7 @@ bootstrap_template1(void)
- 	unsetenv("PGCLIENTENCODING");
- 
- 	snprintf(cmd, sizeof(cmd),
--			 "\"%s\" --boot -x1 -X %u %s %s %s",
-+			 " \"%s\" --boot -x1 -X %u %s %s %s",
- 			 backend_exec,
- 			 wal_segment_size_mb * (1024 * 1024),
- 			 data_checksums ? "-k" : "",
-@@ -2916,10 +2949,11 @@ initialize_data_directory(void)
- 	fflush(stdout);
- 
- 	snprintf(cmd, sizeof(cmd),
--			 "\"%s\" %s template1 >%s",
-+			 " \"%s\" %s template1 >%s",
- 			 backend_exec, backend_options,
- 			 DEVNULL);
- 
-+
- 	PG_CMD_OPEN;
- 
- 	setup_auth(cmdfd);
 diff --git a/src/common/relpath.c b/src/common/relpath.c
-index ad733d1363..eb803699c6 100644
+index 1f5c426ec0..8319302f0d 100644
 --- a/src/common/relpath.c
 +++ b/src/common/relpath.c
 @@ -22,6 +22,7 @@
@@ -615,7 +575,7 @@ index ad733d1363..eb803699c6 100644
  	}
  	else
 diff --git a/src/include/common/relpath.h b/src/include/common/relpath.h
-index 869cabcc0d..4edf77970d 100644
+index a44be11ca0..6128407a49 100644
 --- a/src/include/common/relpath.h
 +++ b/src/include/common/relpath.h
 @@ -29,6 +29,10 @@
@@ -642,10 +602,10 @@ index 869cabcc0d..4edf77970d 100644
  
  #define FORKNAMECHARS	4		/* max chars for a fork name */
 diff --git a/src/include/miscadmin.h b/src/include/miscadmin.h
-index 18bc8a7b90..8a13e0e087 100644
+index 2e2e9a364a..d863b2eb9c 100644
 --- a/src/include/miscadmin.h
 +++ b/src/include/miscadmin.h
-@@ -154,6 +154,7 @@ extern PGDLLIMPORT bool IsBinaryUpgrade;
+@@ -169,6 +169,7 @@ extern PGDLLIMPORT bool IsBinaryUpgrade;
  extern PGDLLIMPORT bool ExitOnAnyError;
  
  extern PGDLLIMPORT char *DataDir;
@@ -653,7 +613,7 @@ index 18bc8a7b90..8a13e0e087 100644
  extern PGDLLIMPORT int data_directory_mode;
  
  extern PGDLLIMPORT int NBuffers;
-@@ -331,6 +332,7 @@ extern const char *GetBackendTypeDesc(BackendType backendType);
+@@ -345,6 +346,7 @@ extern const char *GetBackendTypeDesc(BackendType backendType);
  extern void SetDatabasePath(const char *path);
  extern void checkDataDir(void);
  extern void SetDataDir(const char *dir);
