@@ -1,8 +1,8 @@
-From f432e195d77ddd29df21484aa1383860b9b2876e Mon Sep 17 00:00:00 2001
-From: parmjassal <parmjassalxxxx@gmail.com>
-Date: Mon, 16 Aug 2021 14:58:17 +0530
-Subject: [PATCH] Adding support to add multiple disk under single Namespace.
- The idea behind using multiple disk is to loadbalance the relations across
+From 5d508abfe941202cdbba310cca3f8b31b74df8be Mon Sep 17 00:00:00 2001
+From: parmjassal <xxxx@xxx.com>
+Date: Mon, 16 Aug 2021 15:55:04 +0530
+Subject: [PATCH] Adding support to add multiple disk under single Namespace. 
+ The idea behind using multiple disk is to loadbalance the relations across 
  multiple physical disk for the db.
 
 1. Added lb_dirs configuration in postgres config
